@@ -162,7 +162,8 @@ class ComprehensiveImageProcessor:
     
     def process_property_comprehensive(self, property_id: str, 
                                      images_df: pd.DataFrame) -> Dict[str, Any]:
-        """Process all images for a property with comprehensive analysis"""
+        """Process all images for a property with comprehensive analysis (محسنة للأداء)"""
+        import time
         property_results = {
             'property_id': property_id,
             'images_analyzed': [],
@@ -170,112 +171,95 @@ class ComprehensiveImageProcessor:
             'processing_time': 0,
             'classification_stats': defaultdict(int)
         }
-        
         start_time = time.time()
         images_list = images_df.to_dict('records')
-        
         # Limit images if specified
         if self.max_images:
             remaining = self.max_images - self.stats.total_images_scanned
             if remaining <= 0:
                 return property_results
             images_list = images_list[:remaining]
-        
-        # Process in batches
-        for batch_start in range(0, len(images_list), self.batch_size):
-            batch_end = min(batch_start + self.batch_size, len(images_list))
-            batch_images_info = images_list[batch_start:batch_end]
-            
-            # Prepare batch
-            batch_images = []
-            batch_paths = []
-            batch_indices = []
-            valid_mask = []
-            
-            for idx, img_info in enumerate(batch_images_info):
-                image_name = img_info['ImageName']
-                image_path = IMAGES_ROOT / image_name
-                
-                if image_path.exists():
-                    try:
-                        # Pre-filter check
-                        if not is_valid_interior_image(str(image_path)):
-                            logger.debug(f"Pre-filtered out: {image_path}")
-                            self.stats.total_images_excluded += 1
-                            valid_mask.append(False)
-                        else:
-                            image = Image.open(image_path).convert('RGB')
-                            batch_images.append(image)
-                            batch_paths.append(image_path)
-                            batch_indices.append(batch_start + idx)
-                            valid_mask.append(True)
-                    except Exception as e:
-                        logger.error(f"Error loading image {image_path}: {e}")
-                        valid_mask.append(False)
-                else:
-                    logger.warning(f"Image not found: {image_path}")
-                    valid_mask.append(False)
-                
-                self.stats.total_images_scanned += 1
-            
-            if not batch_images:
-                continue
-            
-            # Comprehensive analysis with multi-stage classification
-            try:
-                analysis_results = self.analyzer.analyze_batch_comprehensive(
-                    batch_images,
-                    batch_paths,
-                    batch_indices
-                )
-                
-                # Process results
-                for result in analysis_results:
-                    result['PropertyID'] = property_id
-                    result['Timestamp'] = datetime.now().isoformat()
-                    
-                    # Update statistics
-                    room_type = result.get('RoomType', 'unknown')
-                    property_results['classification_stats'][room_type] += 1
-                    
-                    if room_type == 'other':
-                        self.stats.total_outdoor_detected += 1
-                    elif room_type == 'excluded':
-                        self.stats.total_images_excluded += 1
-                    
-                    # Track classification method
-                    method = result.get('ClassificationMethod', 'unknown')
-                    self.stats.classification_methods[method] += 1
-                    
-                    # Save to file
-                    save_comprehensive_analysis(OUTPUT_COMPREHENSIVE_FILE, result)
-                    
-                    # Add to property results
-                    property_results['images_analyzed'].append(result)
-                    
-                    self.stats.total_images_analyzed += 1
-                    if room_type and room_type not in ['error', 'unknown', 'excluded', 'other']:
-                        self.stats.total_images_classified += 1
-                
-            except Exception as e:
-                logger.error(f"Error processing batch for property {property_id}: {e}")
-        
+        # --- تحسين: تحميل وتحقيق متوازي ---
+        batch_image_paths = []
+        batch_image_names = []
+        batch_indices = []
+        for idx, img_info in enumerate(images_list):
+            image_name = img_info['ImageName']
+            image_path = IMAGES_ROOT / image_name
+            batch_image_paths.append(image_path)
+            batch_image_names.append(image_name)
+            batch_indices.append(idx)
+        # تحقق متوازي للصور
+        t0 = time.time()
+        valid_mask = batch_is_valid_interior_images([str(p) for p in batch_image_paths])
+        t1 = time.time()
+        # تحميل الصور الصالحة فقط
+        batch_images = []
+        batch_paths = []
+        batch_indices_valid = []
+        for i, is_valid in enumerate(valid_mask):
+            if is_valid and batch_image_paths[i].exists():
+                try:
+                    image = Image.open(batch_image_paths[i]).convert('RGB')
+                    batch_images.append(image)
+                    batch_paths.append(batch_image_paths[i])
+                    batch_indices_valid.append(batch_indices[i])
+                except Exception as e:
+                    logger.error(f"Error loading image {batch_image_paths[i]}: {e}")
+            else:
+                self.stats.total_images_excluded += 1
+        self.stats.total_images_scanned += len(batch_image_paths)
+        t2 = time.time()
+        if not batch_images:
+            return property_results
+        # --- نهاية التحميل والتحقق ---
+        # Comprehensive analysis with multi-stage classification
+        try:
+            t3 = time.time()
+            analysis_results = self.analyzer.analyze_batch_comprehensive(
+                batch_images,
+                batch_paths,
+                batch_indices_valid
+            )
+            t4 = time.time()
+            # Process results
+            for result in analysis_results:
+                result['PropertyID'] = property_id
+                result['Timestamp'] = datetime.now().isoformat()
+                # Update statistics
+                room_type = result.get('RoomType', 'unknown')
+                property_results['classification_stats'][room_type] += 1
+                if room_type == 'other':
+                    self.stats.total_outdoor_detected += 1
+                elif room_type == 'excluded':
+                    self.stats.total_images_excluded += 1
+                # Track classification method
+                method = result.get('ClassificationMethod', 'unknown')
+                self.stats.classification_methods[method] += 1
+                # Save to file
+                save_comprehensive_analysis(OUTPUT_COMPREHENSIVE_FILE, result)
+                # Add to property results
+                property_results['images_analyzed'].append(result)
+                self.stats.total_images_analyzed += 1
+                if room_type and room_type not in ['error', 'unknown', 'excluded', 'other']:
+                    self.stats.total_images_classified += 1
+            # تتبع زمني
+            logger.info(f"[Timing] Property {property_id}: check+load={t2-t0:.2f}s, analysis={t4-t3:.2f}s, total={t4-t0:.2f}s")
+        except Exception as e:
+            logger.error(f"Error processing batch for property {property_id}: {e}")
         # Select best images for this property
         if property_results['images_analyzed']:
             property_results['best_images'] = select_best_images_per_property(
                 property_results['images_analyzed'],
                 SELECTION_WEIGHTS
             )
-            
             # Save best images selection
             save_best_images(
                 OUTPUT_BEST_IMAGES_FILE,
                 property_id,
                 property_results['best_images']
             )
-        
         property_results['processing_time'] = time.time() - start_time
-        
         return property_results
     
     def update_system_stats(self):

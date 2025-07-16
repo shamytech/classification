@@ -17,6 +17,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 import logging
 import hashlib
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
 
@@ -181,58 +182,63 @@ def extract_room_type_from_description(description: str, prompt_index: int = Non
     return 'unknown', 0.0, "No matching keywords found"
 
 def is_valid_interior_image(image_path: str) -> bool:
-    """Check if image is a valid interior photo"""
+    """Check if image is a valid interior photo (محسنة للأداء)"""
     from config import MIN_IMAGE_SIZE, SUPPORTED_FORMATS
-    
     try:
         # Check file extension
         if not any(str(image_path).lower().endswith(ext) for ext in SUPPORTED_FORMATS):
             return False
-        
         # Check if file exists
         if not os.path.exists(image_path):
             return False
-        
-        # Open and check image
+        # تحقق سريع من الهيدر فقط
+        try:
+            with Image.open(image_path) as img:
+                img.verify()  # تحقق من الهيدر فقط
+        except Exception:
+            return False
+        # الآن التحميل الكامل والتحقق الفني
         image = cv2.imread(str(image_path))
         if image is None:
             return False
-        
-        # Check minimum size
         height, width = image.shape[:2]
         if height < MIN_IMAGE_SIZE[0] or width < MIN_IMAGE_SIZE[1]:
             return False
-        
-        # Check if too dark or too bright
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         mean_brightness = gray.mean()
-        
         if mean_brightness < 20 or mean_brightness > 235:
             return False
-        
-        # Check for common exterior indicators
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        
-        # Check for large amounts of green (grass, trees)
         green_mask = cv2.inRange(hsv, (40, 40, 40), (80, 255, 255))
         green_ratio = np.sum(green_mask) / (height * width * 255)
-        
-        if green_ratio > 0.3:  # More than 30% green
+        if green_ratio > 0.3:
             return False
-        
-        # Check for blue sky in upper part
         blue_mask = cv2.inRange(hsv, (100, 50, 50), (130, 255, 255))
         upper_half = blue_mask[:height//2, :]
         blue_ratio = np.sum(upper_half) / (height//2 * width * 255)
-        
-        if blue_ratio > 0.3:  # Significant blue in upper half
+        if blue_ratio > 0.3:
             return False
-        
         return True
-        
     except Exception as e:
         logger.error(f"Error validating image {image_path}: {e}")
         return False
+
+
+def batch_is_valid_interior_images(image_paths: list, max_workers: int = None) -> list:
+    """تحقق متوازي لعدد كبير من الصور - يعيد قائمة من القيم المنطقية بنفس الترتيب"""
+    from config import IMAGE_LOADER_WORKERS
+    if max_workers is None:
+        max_workers = IMAGE_LOADER_WORKERS
+    results = [False] * len(image_paths)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {executor.submit(is_valid_interior_image, path): idx for idx, path in enumerate(image_paths)}
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                results[idx] = future.result()
+            except Exception:
+                results[idx] = False
+    return results
 
 
 def calculate_consistency_score(image_result: Dict, all_results: List[Dict]) -> float:
@@ -370,6 +376,23 @@ def analyze_image_quality(image_path: Path) -> Dict[str, float]:
             'CoverageScore': 0,
             'ClarityScore': 0
         }
+
+
+def batch_analyze_image_quality(image_paths: list, max_workers: int = None) -> list:
+    """تحليل جودة فني متوازي لعدد كبير من الصور - يعيد قائمة من dict بنفس الترتيب"""
+    from config import PREPROCESSING_WORKERS
+    if max_workers is None:
+        max_workers = PREPROCESSING_WORKERS
+    results = [None] * len(image_paths)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_idx = {executor.submit(analyze_image_quality, path): idx for idx, path in enumerate(image_paths)}
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                results[idx] = future.result()
+            except Exception:
+                results[idx] = None
+    return results
 
 
 def calculate_coverage_score(image: np.ndarray) -> float:
