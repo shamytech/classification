@@ -27,7 +27,9 @@ from utils import (
     get_cache_key,
     load_from_cache,
     save_to_cache,
-    calculate_response_quality
+    calculate_response_quality,
+    batch_is_valid_interior_images,  # جديد
+    batch_analyze_image_quality      # جديد
 )
 
 logger = logging.getLogger(__name__)
@@ -152,22 +154,20 @@ class BLIP2ImageAnalyzer:
     def analyze_batch_comprehensive(self, images: List[Image.Image], 
                                   image_paths: List[Path], 
                                   image_indices: List[int]) -> List[Dict[str, Any]]:
-        """Comprehensive analysis with multi-stage classification"""
+        """Comprehensive analysis with multi-stage classification (محسنة للأداء)"""
+        import config
         start_time = time.time()
         batch_size = len(images)
         results = []
-        
         try:
-            # Filter valid interior images first
-            valid_indices = []
-            for i, path in enumerate(image_paths):
-                if is_valid_interior_image(str(path)):
-                    valid_indices.append(i)
-                else:
-                    # Add excluded result
+            # تحقق متوازي للصور الداخلية
+            valid_mask = batch_is_valid_interior_images([str(p) for p in image_paths])
+            valid_indices = [i for i, v in enumerate(valid_mask) if v]
+            for i, is_valid in enumerate(valid_mask):
+                if not is_valid:
                     results.append({
-                        'ImagePath': str(path),
-                        'ImageName': path.name,
+                        'ImagePath': str(image_paths[i]),
+                        'ImageName': image_paths[i].name,
                         'ImageOrder': image_indices[i],
                         'RoomType': 'excluded',
                         'Confidence': 0.0,
@@ -178,86 +178,50 @@ class BLIP2ImageAnalyzer:
                         'OverallQualityScore': 0.0,
                         'ProcessingTime': 0.0
                     })
-            
             if not valid_indices:
                 return results
-            
-            # Process only valid images
             valid_images = [images[i] for i in valid_indices]
             valid_paths = [image_paths[i] for i in valid_indices]
             valid_image_indices = [image_indices[i] for i in valid_indices]
-            
             # 1. Multi-stage BLIP2 Classification
             classifications = self._multi_stage_classification(valid_images, valid_paths)
-            
-            # 2. Technical Quality Analysis (parallel)
-            with ThreadPoolExecutor(max_workers=min(len(valid_images), 8)) as executor:
-                tech_futures = {
-                    executor.submit(analyze_image_quality, path): idx 
-                    for idx, path in enumerate(valid_paths)
-                }
-                
-                tech_qualities = [None] * len(valid_images)
-                for future in as_completed(tech_futures):
-                    idx = tech_futures[future]
-                    tech_qualities[idx] = future.result()
-            
+            # 2. تحليل جودة فني متوازي
+            tech_qualities = batch_analyze_image_quality(valid_paths)
             # 3. Calculate consistency scores
             consistency_scores = self._calculate_batch_consistency(classifications)
-            
             # 4. Combine all results
             for i in range(len(valid_images)):
-                # Calculate response quality from BLIP2 responses
                 blip2_responses = {
                     'BLIP2Response1': classifications[i]['all_results'][0]['response'] if len(classifications[i]['all_results']) > 0 else '',
                     'BLIP2Response2': classifications[i]['all_results'][1]['response'] if len(classifications[i]['all_results']) > 1 else '',
                 }
-                
                 response_quality = calculate_response_quality(blip2_responses)
-                
-                # Calculate overall quality score
                 overall_quality = calculate_overall_quality_score(
                     tech_qualities[i],
                     classifications[i]['confidence'],
                     response_quality
                 )
-                
-                # Compile comprehensive result
                 result = {
                     'ImagePath': str(valid_paths[i]),
                     'ImageName': valid_paths[i].name,
                     'ImageOrder': valid_image_indices[i],
-                    
-                    # Classification
                     'RoomType': classifications[i]['room_type'],
                     'Confidence': classifications[i]['confidence'],
                     'ClassificationMethod': 'multi_stage',
                     'MultiStageResults': classifications[i].get('all_results', {}),
                     'ConsistencyScore': consistency_scores[i],
-                    
-                    # BLIP2 Responses
                     **blip2_responses,
-                    
-                    # Technical quality
                     **tech_qualities[i],
                     'OverallQualityScore': overall_quality,
-                    
-                    # Metadata
                     'ProcessingTime': round(time.time() - start_time, 3)
                 }
-                
                 results.append(result)
-                
-                # Save to cache if enabled
                 if self.cache_dir:
                     cache_key = get_cache_key(str(valid_paths[i]), 'comprehensive_analysis')
                     save_to_cache(cache_key, result, self.cache_dir)
-            
             return results
-            
         except Exception as e:
             logger.error(f"Error in comprehensive analysis: {e}")
-            # Return basic results on error
             return self._fallback_analysis(images, image_paths, image_indices)
 
     def _multi_stage_classification(self, images: List[Image.Image], 
